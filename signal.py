@@ -20,9 +20,9 @@ SIGNAL_QUANTILE = 0.80
 # 从 GitHub Secrets 读取邮箱配置
 SMTP_HOST = "smtp.qq.com"
 SMTP_PORT = 465
-MAIL_USER = os.environ.get("MAIL_USER")      # 你的QQ邮箱
-MAIL_PASS = os.environ.get("MAIL_PASS")      # 16位授权码
-MAIL_TO   = os.environ.get("MAIL_TO")        # 收件邮箱（可以和发件相同）
+MAIL_USER = os.environ.get("MAIL_USER")
+MAIL_PASS = os.environ.get("MAIL_PASS")
+MAIL_TO   = os.environ.get("MAIL_TO")
 
 def send_email(subject: str, body: str):
     if not all([MAIL_USER, MAIL_PASS, MAIL_TO]):
@@ -41,7 +41,7 @@ def main():
     now = datetime.now()
     print(f"开始运行：{now}")
 
-    # 1. 取全市场行情（临时屏蔽 tqdm.notebook）
+    # 1. 取全市场行情
     try:
         with patch("akshare.stock.stock_zh_a_sina.get_tqdm", return_value=text_tqdm):
             quotes = ak.stock_zh_a_spot()
@@ -52,25 +52,25 @@ def main():
 
     print(f"取到股票数：{len(quotes)}")
 
-    # 2. 简单计算今日上涨广度（注意：这里用「最新价 / 昨收」近似，后续可再优化成真正的昨日14:55参考价）
+    # 2. 计算今日上涨广度（用最新价/昨收近似）
     quotes = quotes.copy()
     quotes["最新价"] = pd.to_numeric(quotes["最新价"], errors="coerce")
     quotes["昨收"] = pd.to_numeric(quotes["昨收"], errors="coerce")
     valid = quotes["最新价"].gt(0) & quotes["昨收"].gt(0)
     ret = quotes.loc[valid, "最新价"] / quotes.loc[valid, "昨收"] - 1
-    n_valid = valid.sum()
-    n_up4 = (ret > UP_THRESHOLD).sum()
+    n_valid = int(valid.sum())
+    n_up4 = int((ret > UP_THRESHOLD).sum())
     breadth = (n_up4 + 0.5) / (n_valid + 1) if n_valid > 0 else np.nan
 
-    # 3. 读取历史并计算信号
+    # 3. 读取或创建历史
+    today_str = now.strftime("%Y-%m-%d")
+
     if HISTORY_FILE.exists():
         hist = pd.read_csv(HISTORY_FILE, parse_dates=["date"])
+        # 去掉同一天已有的记录，避免重复
+        hist = hist[hist["date"].dt.strftime("%Y-%m-%d") != today_str]
     else:
         hist = pd.DataFrame(columns=["date", "breadth", "n_valid", "n_up4"])
-
-    today_str = now.strftime("%Y-%m-%d")
-    # 避免同一天重复写入
-    hist = hist[hist["date"].dt.strftime("%Y-%m-%d") != today_str]
 
     new_row = pd.DataFrame([{
         "date": today_str,
@@ -82,7 +82,7 @@ def main():
     hist = hist.sort_values("date").reset_index(drop=True)
     hist.to_csv(HISTORY_FILE, index=False)
 
-    # 计算得分和门槛（窗口不足时标记）
+    # 4. 计算得分和门槛
     hist["normalizer"] = hist["breadth"].shift(1).rolling(NORM_WINDOW, min_periods=NORM_WINDOW).median()
     hist["score"] = hist["breadth"] / hist["normalizer"]
     hist["threshold"] = hist["score"].shift(1).rolling(BASE_WINDOW, min_periods=BASE_WINDOW).quantile(SIGNAL_QUANTILE)
@@ -93,12 +93,11 @@ def main():
     signal = bool(score >= threshold) if pd.notna(threshold) else False
     window_ok = pd.notna(threshold)
 
-    # 4. 组装邮件
+    # 5. 组装并发送邮件
     status = "数据窗口充足，信号有效" if window_ok else "历史窗口不足（需要约140个交易日），仅观察，勿直接交易"
     signal_text = "【建议开仓】" if signal and window_ok else "【空仓 / 观察】"
 
-    body = f"""
-上涨广度择时信号（GitHub Actions 测试版）
+    body = f"""上涨广度择时信号（GitHub Actions 测试版）
 ========================================
 运行时间：{now}
 采样股票数：{len(quotes)}
